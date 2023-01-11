@@ -1,0 +1,214 @@
+---
+title: "A05_collaborative"
+author: "Amit Singh"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+
+```{r dataload}
+
+#library loads
+library(lme4)
+library(ggplot2)
+library(simr)
+library(lmerTest)
+
+
+
+# PREPROCESSING AND DATA CLEAN
+
+
+#loading the data
+data_rt <- read.csv2('scenario_reaction_times.csv', header=TRUE)
+
+#converting participants to factor
+data_rt$ParticipantID<-as.factor(data_rt$ParticipantID)
+data_rt$InstructionType<-as.factor(data_rt$InstructionType)
+data_rt$ExplanationType<-as.factor(data_rt$ExplanationType)
+#data_rt<-data_rt[which(data_rt$Iteration!=),]
+
+
+#columns rename
+names(data_rt)[names(data_rt)=='VisitSceneCount']<- 'iter_count'
+names(data_rt)[names(data_rt)=='SceneDescription']<- 'item'
+
+
+#rataining the relevant variables
+data_clean <- data_rt[c('ParticipantID', 'InstructionType', 'iter_count', 'item', 'TimeUntilFirstInteraction', 'ExplanationType')]
+
+#removing the extreme values above 6 (suspected outliers)
+data_clean<-data_clean[data_clean$TimeUntilFirstInteraction<6,]
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r summary}
+#summary
+summary(data_clean)
+
+#visualisation
+hist(data_clean$TimeUntilFirstInteraction, breaks = 15, prob=TRUE)
+```
+
+
+
+```{r visualize}
+#log-transform
+data_clean$TimeUntilFirstInteraction_log<-log(data_clean$TimeUntilFirstInteraction) 
+
+#visualization, for normality assumption
+hist(data_clean$TimeUntilFirstInteraction_log, breaks = 15, prob=TRUE)
+
+```
+
+
+
+
+```{r plots}
+
+#plotting the individual responses
+ggplot(data=data_clean, aes(iter_count, TimeUntilFirstInteraction_log, group=ParticipantID))+
+  stat_summary(geom = "pointrange")+
+  theme_bw(base_size = 10)+
+  stat_summary(fun = mean, geom="line")+
+  facet_grid(rows = vars(InstructionType))
+
+
+#factor re-level, setting None-Affirmation as baseline
+data_clean$ExplanationType<- relevel(data_clean$ExplanationType, "None Contrastive")
+data_clean$InstructionType<- relevel(data_clean$InstructionType, "None-Affirmation")
+
+
+#plotting the grouped data
+ggplot(data= data_clean, aes(iter_count, TimeUntilFirstInteraction_log, color=InstructionType))+
+  stat_summary(fun.y=mean, geom='line', size=0.5, alpha=0.5)+
+  stat_summary(fun.data = 'mean_se', size=1)+
+  theme_bw(base_size = 10)+
+  #coord_cartesian(ylim=c(0, 1.0)) +
+  scale_x_continuous(breaks=1:5)
+  #facet_grid(cols = vars(SceneDescription))
+  
+
+```
+
+#Growth curve analysis with linear and quadratic time (iter_count) terms as the predictor
+```{r GCA}
+
+#Growth curve analysis
+
+
+t <- poly(unique(data_clean$iter_count), 2)
+data_clean[,paste("ot", 1:2, sep="")] <- t[data_clean$iter_count, 1:2]
+#
+m.base <- lmer(TimeUntilFirstInteraction_log ~ (ot1+ot2) + (ot1 | ParticipantID), data=data_clean, REML=FALSE)
+#
+m.0 <- lmer(TimeUntilFirstInteraction_log ~ (ot1+ot2) + InstructionType + (ot1 | ParticipantID), data=data_clean, REML=FALSE)
+#
+m.1 <- lmer(TimeUntilFirstInteraction_log ~ (ot1+ot2) + InstructionType + ot1:InstructionType + (ot1 | ParticipantID), data=data_clean, REML=FALSE)
+#
+m.2 <- lmer(TimeUntilFirstInteraction_log ~ (ot1+ot2)*InstructionType + (ot1 | ParticipantID), data=data_clean, REML=FALSE)
+#
+#
+anova(m.base, m.0, m.1, m.2)
+#goodness of fit, linear model is the best fit (m.1)
+
+summary(m.1)
+
+#visualizing the best model (m.1)
+ggplot(data_clean, aes(iter_count, TimeUntilFirstInteraction_log, color=InstructionType)) +
+           #stat_summary(aes(color=InstructionType),fun.y=mean) +
+           #geom_boxplot() +
+           #facet_wrap(~ExplanationType)+
+           stat_summary(fun.data=mean_se,geom="pointrange",size=1)+
+           stat_summary(aes(y=fitted(m.1)),
+                        fun.y=mean, geom="line", size=0.8, alpha=0.5) +
+           theme_bw(base_size=10)
+
+
+
+
+```
+
+
+Fitting the traditional linear models with lme4 package
+
+```{r mplot}
+
+#linear model fits
+
+#our base model
+load.base <- lmer(TimeUntilFirstInteraction_log ~ 1 + iter_count + (1 + iter_count || ParticipantID), data=data_clean, REML=F)
+
+#Level - 1 model, adding InstructionType (condition) as fixed intercept 
+load.0 <- lmer(TimeUntilFirstInteraction_log ~ 1 + iter_count + InstructionType + (1 + iter_count || ParticipantID) , data=data_clean, REML=F)
+
+#Level-2 model, adding InstructionType (condition) as fixed slope over linear time term (iteration)
+load.1 <- lmer(TimeUntilFirstInteraction_log ~ iter_count + InstructionType + iter_count:InstructionType + (1 + iter_count || ParticipantID), data=data_clean, REML=F)
+
+#log-likelihood test (Chi-sq goodness of fit) 
+anova(load.base, load.0, load.1)
+
+# 'load.1' model is the best fit. 
+
+#model visualization
+ggplot(data_clean, aes(iter_count, TimeUntilFirstInteraction_log, color=InstructionType)) +
+           #stat_summary(aes(color=InstructionType),fun.y=mean) +
+           #geom_boxplot() +
+           #facet_wrap(~ExplanationType)+
+           stat_summary(fun.data=mean_se,geom="pointrange",size=1)+
+           stat_summary(aes(y=fitted(load.1)),
+                        fun.y=mean, geom="line", size=1) +
+           theme_bw(base_size=10)
+
+
+
+#model summary
+summary(load.1)
+
+
+
+```
+
+
+
+```{r power analysis, eval=FALSE}
+# POWER ANALYSIS
+
+#power for model load.1
+power_init<- powerSim(load.1, fixed('iter_count:InstructionType', method = c("anova")))
+
+#increasing number of participants to 50
+
+m.1_power_model <- extend(load.1, along="ParticipantID", n=50)
+
+
+#checking for power
+power_extend<- powerSim(m.0_power_model, fixed('iter_count:InstructionType'))
+
+#power for a range of values
+pcurve.01<-powerCurve(m.1_power_model, fixed('iter_count:InstructionType'), along = 'ParticipantID')
+
+print(pcurve.01)
+
+plot(pcurve.01)
+
+```
+
+
+
+
+
+
+

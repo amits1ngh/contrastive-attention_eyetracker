@@ -1,0 +1,354 @@
+---
+title: "21.12_fixation_coordinate_analysis"
+author: "Amit Singh"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+#loading necessary packages
+knitr::opts_chunk$set(echo = TRUE)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(data.table)
+library(ggplot2)
+library(rmarkdown)
+library(broom)
+library(broom.mixed)
+library(knitr)
+library(lme4)
+library(lmerTest)
+library(devtools)
+library(effects)
+library(emmeans)
+library(multcomp)
+
+#===============================================================================
+
+#User defined functions
+
+#function for binning the trials
+bin_data = function(d1) {
+  
+  d1$bin = NA #creates a new column within the dataframe d for the time bins, which is filled with Not A Number
+  lentrials = rle(d1$trialID)$lengths#get length of each trial
+  
+  for (i in seq(1,length(lentrials))){ # iterating through length of each trial
+    
+    timePlot = lentrials[i]
+    nbins = timePlot/6 # each frame is approx 
+    binTrial = rep(1:nbins, each=6) #6 frames = 50 ms (eye-tracker sampling rate = 120Hz)
+    ind = sum(lentrials[1:i-1])+1 # get onset of current trial, i.e. sum the length of previous trials (i-1) and add 1 frame to get first frame
+    d1$bin[ind:(ind+length(binTrial)-1)] = binTrial# add bin column from target start
+  }
+  
+  d1 = d1[which(d1$bin!="NA"),]
+  d1$N<-6 #total nummer of samples
+  return(d1) #return dataframe
+}
+
+
+
+#identifying trackloss
+grp_data_trackloss = function(df) {
+  
+  df_grp <- df %>% 
+    group_by(SubjID, voice_condition, path_types, metrics_type) %>%
+  dplyr::summarise(
+    len_trackloss=n())
+  return(df_grp)
+}
+
+#getting length of trials for trackloss analysis
+grp_data_trial = function(df) {
+  
+  df_grp <- df %>% 
+    group_by(SubjID, voice_condition, path_types) %>%
+  dplyr::summarise(
+    len_trial=n())
+  return(df_grp)
+}
+
+
+#calculation of fixation proportion
+fix_prop = function(df) {
+  
+  df$path_log <- with(df, log((PathHit+0.5) / (N-PathHit+0.5)))
+  df$manner_log <- with(df, log((MannerHit+0.5) / (N-MannerHit+0.5)))
+  df$manner_path_bias<-with(df, manner_log-path_log)
+  return(df)
+}
+
+
+#function for fitting models for each data frame list (df = dataframe list)
+
+create_model <- function(df) {
+  
+  model_list<-list()
+  factors<-list('Assertion-Assertion', 'Negation-Negation', 'Assertion-Negation', 'Negation-Assertion')
+  
+  for (i in seq(1:length(df))) {
+    
+    t <- poly(unique(df[[i]]$bin), 4)
+    df[[i]][,paste("time", 1:4, sep="")] <- t[df[[i]]$bin, 1:4] #adding polynomials to our dataframe 
+    df[[i]]$voice_condition<-factor(df[[i]]$voice_condition, levels = c("No Voice (Baseline)", factors[[i]]))#relevel factors to get No Voice as Baseline
+    m_fixation_base<- lmer(manner_path_bias ~ (time1+time2+time3+time4) + 
+                      (1|SubjID) + (1|SubjID:voice_condition), control=lmerControl(optimizer = "bobyqa"), data=df[[i]], REML=F, verbose = 100) #our base model with four time terms 
+    m_fixation_null<- lmer(manner_path_bias ~ (time1+time2+time3+time4)+voice_condition + 
+                      (1|SubjID) + (1|SubjID:voice_condition), control=lmerControl(optimizer = "bobyqa"), data=df[[i]], REML=F, verbose = 100)#level one model without time interaction
+    m_fixation_1<- lmer(manner_path_bias ~ (time2+time3+time4) + time1:voice_condition+
+                       (1|SubjID) + (1|SubjID:voice_condition), control=lmerControl(optimizer = "bobyqa"), data=df[[i]], REML=F, verbose = 100)#interaction with linear time term
+    m_fixation_2<- lmer(manner_path_bias ~ (time1+time2)*voice_condition + (time3+time4) +
+                      (1|SubjID) + (1|SubjID:voice_condition), control=lmerControl(optimizer = "bobyqa"), data=df[[i]], REML=F, verbose = 100)#interaction with quadratic time term
+    m_fixation_3<- lmer(manner_path_bias ~ (time4) + (time1+time2+time3)*voice_condition +
+                      (1|SubjID) + (1|SubjID:voice_condition), control=lmerControl(optimizer = "bobyqa"), data=df[[i]], REML=F, verbose = 100)#interaction with cubic time term
+    m_fixation_4<- lmer(manner_path_bias ~  (time1+time2+time3+time4)*voice_condition + 
+                      (1|SubjID) + (1|SubjID:voice_condition), control=lmerControl(optimizer = "bobyqa"), data=df[[i]], REML=F, verbose = 100)#interaction with quartic time term
+    model_list[[i]]<-list(m_fixation_base, m_fixation_null, m_fixation_1, m_fixation_2, m_fixation_3, m_fixation_4)#saving models as list
+    df[[i]]$fitted<-fitted(m_fixation_4)#saving the fitted values in each dataframe for later plotting
+  }
+  
+  list_all<-list(df, model_list) #creating list for dataframe and models
+  return(list_all)#return the full list
+} 
+
+
+#function for plotting the fits and datasets 
+plot_lists<- function(df){   #takes input as the list saved by 'create_model' function 
+  
+  plots<-list() #init variable for the plot lists 
+  
+  for (i in seq(1:length(df[[1]]))) { #looping through the model list to get each dataframe by model
+    
+    fix_plot<-ggplot(df[[1]][[i]], aes(x=bin, y=manner_path_bias, group=voice_condition, color=voice_condition))+ #setting the datframe for plotting
+      stat_summary(geom ='line', fun ='mean', size=1, alpha=0.8,aes(y=fitted))+ #plotting the fitted values
+      stat_summary(fun.data = mean_se, geom = "pointrange", alpha = 0.3, fatten=0.5 ,size = 0.5)+#plotting the raw data over fitted values
+      theme_light() + #plot aesthetics 
+      scale_color_manual(breaks=c('No Voice (Baseline)', 'Assertion-Assertion', 'Negation-Negation', 'Negation-Assertion', 'Assertion-Negation'),                      
+                     values=c('No Voice (Baseline)' = '#999999', 
+                              'Assertion-Assertion' = '#E69F00', 
+                              'Negation-Negation' = '#56B4E9', 
+                              'Negation-Assertion' ='#93B489', 
+                              'Assertion-Negation' ='#F6846C'),
+                     labels = c('No Voice (Baseline)', 'Only Assertion', 'Only Negation', 'Negation-Assertion', 'Assertion-Negation'))+
+      theme(legend.position = c(.09,.90), #legend aesthetics
+        legend.key.size = unit(0.5, 'cm'),
+        legend.key.height = unit(0.35, 'cm'),
+        legend.key.width = unit(0.4, 'cm'),
+        legend.text=element_text(size=5.5),
+        legend.title=element_blank(),
+        legend.box.background = element_rect(colour = "black"),
+        axis.text=element_text(size=10),
+        axis.title=element_text(size=10,face="bold"),
+        axis.text.x = element_text(face="bold", color="black", size=8),
+        axis.text.y = element_text(face="bold", color="black", size=8))+
+        labs(x ="Time bins",y ="Proportion of Manner minus Path fixations")+
+      scale_x_continuous(breaks=seq(1, length(df[[1]][[i]]$bin), 5))+
+      geom_vline(xintercept = 75, linetype='dotted', color = "black", size=0.5)+
+      annotate("text", x = 90, y = 0.90, label = "Manner preference")+
+      annotate("text", x = 90, y = 0.0, label = "Path preference") 
+    plots[[i]]<-fix_plot #appending the plots in list order
+    }
+
+return(plots)#return plot lists
+}
+
+
+#plot saving
+plotsave<-function(plot_list){  #takes input as a list of plots
+  for (i in seq(1:length(plot_list))){ # iterting through the plot lists
+    plot_list[[i]] #indexing the current plot
+    ggsave(file=paste0("plot",i,".jpg"), plot = plot_list[[i]], width = 7.50,height = 3.75,dpi = 300) #saving the plot as separate files
+    }
+  }
+
+
+
+df_clean<-df_clean[df_clean$metrics_type=='Fixation',]
+
+df_binned<-bin_data(df_clean)
+
+df_binned<-fix_prop(df_binned)
+```
+
+
+## binning data and grouping
+
+```{r analysis_C2, echo=FALSE}
+
+df_Cont_A<- filter(df_binned, path_types=='Contrastive_A')#filter data for Contrastive Condition (C2)
+
+df_Cont_A<-df_Cont_A[df_Cont_A$bin>=13 & df_Cont_A$bin<=137,]
+
+df_Cont_A$bin<-df_Cont_A$bin-12
+
+#plotting the raw data
+plot_path_bias<-ggplot(df_Cont_A, aes(x= bin, y=manner_path_bias, color=voice_condition))+
+  stat_summary(fun.data = 'mean_se', geom='pointrange', alpha=0.5) + 
+  #stat_summary(fun = 'mean', geom='line', alpha=0.7)+
+  facet_grid(rows=vars(path_types), scales = 'free')+
+  scale_x_continuous(breaks=seq(1, length(df_Cont_A$bin), 1))+
+  theme_bw()
+
+plot_path_bias
+
+
+df_only_assertive<- df_Cont_A[df_Cont_A$voice_condition=='No Voice (Baseline)' | df_Cont_A$voice_condition=='Assertion-Assertion',]
+df_only_negation<- df_Cont_A[df_Cont_A$voice_condition=='No Voice (Baseline)' | df_Cont_A$voice_condition=='Negation-Negation',]
+df_assertion_negation<- df_Cont_A[df_Cont_A$voice_condition=='No Voice (Baseline)' | df_Cont_A$voice_condition=='Assertion-Negation',]
+df_negation_assertion<- df_Cont_A[df_Cont_A$voice_condition=='No Voice (Baseline)' | df_Cont_A$voice_condition=='Negation-Assertion',]
+
+df_cont_A_grouped<- list(df_only_assertive, df_only_negation, df_assertion_negation, df_negation_assertion)
+
+
+df_fitted_<-create_model(df_cont_A_grouped)  
+  
+plot_list<-plot_lists(df_fitted)
+
+plotsave(plot_list)
+
+summary(df_fitted[[2]][[4]][[6]])
+
+#reporting in paper (fixed effects)
+model<-kable(tidy(m_fixation_4), effects = "fixed", digits = 2)
+
+
+```
+
+##Growth Curve Analysis for Contrastive condition (Sequence C2)
+
+```{r analysis_C1, echo=FALSE}
+#filter data for Non-Contrastive Condition (C1)
+
+df_NCont_A<- filter(df_binned, path_types=='Non-Contrastive_A')
+
+
+df_NCont_A<-df_NCont_A[df_NCont_A$bin>=20 & df_NCont_A$bin<=123,]
+
+
+df_NCont_A$bin<-df_NCont_A$bin-19
+
+
+#plotting the raw data
+plot_path_bias<-ggplot(df_NCont_A, aes(x= bin, y=manner_path_bias, color=voice_condition))+
+  stat_summary(fun.data = 'mean_se', geom='pointrange', alpha=0.5) + 
+  #stat_summary(fun = 'mean', geom='line', alpha=0.7)+
+  facet_grid(rows=vars(path_types), scales = 'free')+
+  scale_x_continuous(breaks=seq(1, length(df_NCont_A$bin), 5))+
+  theme_bw()
+
+plot_path_bias
+
+df_only_assertive_NCA<- df_NCont_A[df_NCont_A$voice_condition=='No Voice (Baseline)' | df_NCont_A$voice_condition=='Assertion-Assertion',]
+df_only_negation_NCA<- df_NCont_A[df_NCont_A$voice_condition=='No Voice (Baseline)' | df_NCont_A$voice_condition=='Negation-Negation',]
+df_assertion_negation_NCA<- df_NCont_A[df_NCont_A$voice_condition=='No Voice (Baseline)' | df_NCont_A$voice_condition=='Assertion-Negation',]
+df_negation_assertion_NCA<- df_NCont_A[df_NCont_A$voice_condition=='No Voice (Baseline)' | df_NCont_A$voice_condition=='Negation-Assertion',]
+
+df_Ncont_A_grouped<- list(df_only_assertive_NCA, df_only_negation_NCA, df_assertion_negation_NCA, df_negation_assertion_NCA)
+
+
+df_fitted_C1<-create_model(df_Ncont_A_grouped)  
+  
+plot_list<-plot_lists(df_fitted_C1)
+
+plotsave(plot_list)
+
+summary(df_fitted[[2]][[2]][[6]])
+
+#reporting in paper (fixed effects)
+model<-kable(tidy(m_fixation_4), effects = "fixed", digits = 2)
+
+```
+
+```{r analysis_C3, echo=FALSE}
+#filter data for Non-Contrastive Condition (C3)
+
+df_NCont_B<- filter(df_binned, path_types=='Non-Contrastive_B')
+
+
+df_NCont_B<-df_NCont_B[df_NCont_B$bin>=21 & df_NCont_B$bin<=171,]
+
+
+df_NCont_B$bin<-df_NCont_B$bin-20
+
+
+#plotting the raw data
+plot_path_bias<-ggplot(df_NCont_B, aes(x= bin, y=manner_path_bias, color=voice_condition))+
+  stat_summary(fun.data = 'mean_se', geom='pointrange', alpha=0.5) + 
+  #stat_summary(fun = 'mean', geom='line', alpha=0.7)+
+  facet_grid(rows=vars(path_types), scales = 'free')+
+  scale_x_continuous(breaks=seq(1, length(df_NCont_A$bin), 5))+
+  theme_bw()
+
+plot_path_bias
+
+df_only_assertive_NCB<- df_NCont_B[df_NCont_B$voice_condition=='No Voice (Baseline)' | df_NCont_B$voice_condition=='Assertion-Assertion',]
+df_only_negation_NCB<- df_NCont_B[df_NCont_B$voice_condition=='No Voice (Baseline)' | df_NCont_B$voice_condition=='Negation-Negation',]
+df_assertion_negation_NCB<- df_NCont_B[df_NCont_B$voice_condition=='No Voice (Baseline)' | df_NCont_B$voice_condition=='Assertion-Negation',]
+df_negation_assertion_NCB<- df_NCont_B[df_NCont_B$voice_condition=='No Voice (Baseline)' | df_NCont_B$voice_condition=='Negation-Assertion',]
+
+df_Ncont_B_grouped<- list(df_only_assertive_NCB, df_only_negation_NCB, df_assertion_negation_NCB, df_negation_assertion_NCB)
+
+
+df_fitted_C3<-create_model(df_Ncont_B_grouped)  
+  
+plot_list<-plot_lists(df_fitted_C3)
+
+plotsave(plot_list)
+
+summary(df_fitted[[2]][[2]][[6]])
+
+#reporting in paper (fixed effects)
+model<-kable(tidy(m_fixation_4), effects = "fixed", digits = 2)
+
+```
+
+
+
+##Growth Curve Analysis for Non-Contrastive condition (C1)
+```{r analysis_C4, echo=FALSE}
+#filter data for Non-Contrastive Condition (C4)
+
+df_Cont_B<- filter(df_binned, path_types=='Contrastive_B')
+
+
+df_Cont_B<-df_Cont_B[df_Cont_B$bin>=20 & df_Cont_B$bin<=161,]
+
+
+df_Cont_B$bin<-df_Cont_B$bin-19
+
+
+#plotting the raw data
+plot_path_bias<-ggplot(df_Cont_B, aes(x= bin, y=manner_path_bias, color=voice_condition))+
+  stat_summary(fun.data = 'mean_se', geom='pointrange', alpha=0.5) + 
+  #stat_summary(fun = 'mean', geom='line', alpha=0.7)+
+  facet_grid(rows=vars(path_types), scales = 'free')+
+  scale_x_continuous(breaks=seq(1, length(df_Cont_B$bin), 5))+
+  theme_bw()
+
+plot_path_bias
+
+df_only_assertive_CB<- df_Cont_B[df_Cont_B$voice_condition=='No Voice (Baseline)' | df_Cont_B$voice_condition=='Assertion-Assertion',]
+df_only_negation_CB<- df_Cont_B[df_Cont_B$voice_condition=='No Voice (Baseline)' | df_Cont_B$voice_condition=='Negation-Negation',]
+df_assertion_negation_CB<- df_Cont_B[df_Cont_B$voice_condition=='No Voice (Baseline)' | df_Cont_B$voice_condition=='Assertion-Negation',]
+df_negation_assertion_CB<- df_Cont_B[df_Cont_B$voice_condition=='No Voice (Baseline)' | df_Cont_B$voice_condition=='Negation-Assertion',]
+
+df_cont_B_grouped<- list(df_only_assertive_CB, df_only_negation_CB, df_assertion_negation_CB, df_negation_assertion_CB)
+
+
+df_fitted_C4<-create_model(df_cont_B_grouped)  
+  
+plot_list<-plot_lists(df_fitted_C4)
+
+plotsave(plot_list)
+
+summary(df_fitted_C4[[2]][[2]][[6]])
+
+#reporting in paper (fixed effects)
+model<-kable(tidy(m_fixation_4), effects = "fixed", digits = 2)
+
+```
+
